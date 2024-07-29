@@ -1,78 +1,84 @@
 from pyspark.sql import SparkSession
-from pyspark.ml.classification import LogisticRegression
+from pyspark.ml.feature import VectorAssembler, StandardScaler
+from pyspark.ml.classification import RandomForestClassifier, RandomForestClassificationModel
 from pyspark.ml.evaluation import MulticlassClassificationEvaluator
-from pyspark.ml.feature import VectorAssembler
-import os
 
-def set_spark_environment(spark_home, spark_bin):
-	"""Set the Spark home and update the PATH."""
-	os.environ['SPARK_HOME'] = spark_home
-	os.environ['PATH'] += os.pathsep + spark_bin
+# Instantiate the Spark session
+spark = SparkSession.builder.appName("WineQualityPrediction").getOrCreate()
 
-def initialize_spark(app_name, master_url):
-	"""Initialize and return a Spark session."""
-	return SparkSession.builder \
-		.appName(wineQuaprediction) \
-		.master(master_url) \
-		.getOrCreate()
+# Load cleaned datasets
+train_output_file = "/home/ec2-user/TrainingDataset_cleaned.csv"
+valid_output_file = "/home/ec2-user/ValidationDataset_cleaned.csv"
 
-def clean_column_names(df):
-	"""Clean column names by removing spaces and quotes."""
-	return df.toDF(*(c.replace(' ', '').replace('"', '') for c in df.columns))
+train_data = spark.read.csv(train_output_file, header=True, inferSchema=True, sep=';')
+valid_data = spark.read.csv(valid_output_file, header=True, inferSchema=True, sep=';')
 
-def load_and_preprocess_data(spark, file_path, feature_cols):
-	"""Load and preprocess data from a CSV file."""
-	data = spark.read.csv(file_path, header=True, inferSchema=True)
-	data = clean_column_names(data)
-	assembler = VectorAssembler(inputCols=feature_cols, outputCol="features")
-	return assembler.transform(data).select("features", "quality")
+# Eliminate rows containing null values
+train_data = train_data.dropna()
+valid_data = valid_data.dropna()
 
-def train_logistic_regression(training_data):
-	"""Train a Logistic Regression model."""
-	lr = LogisticRegression(featuresCol='features', labelCol='quality')
-	return lr.fit(training_data)
+# Arrange the columns for features and labels.
+feature_columns = [col for col in train_data.columns if col != 'quality']
+assembler = VectorAssembler(inputCols=feature_columns, outputCol='features')
 
-def evaluate_model(predictions):
-	"""Evaluate the model using F1 score."""
-	evaluator = MulticlassClassificationEvaluator(labelCol='quality', predictionCol='prediction', metricName='f1')
-	return evaluator.evaluate(predictions)
+# Process the data
+train_data = assembler.transform(train_data).select('features', 'quality')
+valid_data = assembler.transform(valid_data).select('features', 'quality')
 
-def main():
-	# Set Spark environment
-	spark_home = '/home/ubuntu/spark-3.5.0-bin-hadoop3'
-	spark_bin = os.path.join(spark_home, 'bin')
-	set_spark_environment(spark_home, spark_bin)
+# Normalize the characteristics
+scaler = StandardScaler(inputCol="features", outputCol="scaledFeatures", withStd=True, withMean=True)
+scaler_model = scaler.fit(train_data)
+train_data = scaler_model.transform(train_data).select("scaledFeatures", "quality")
+valid_data = scaler_model.transform(valid_data).select("scaledFeatures", "quality")
 
-	# Initialize Spark session
-	master_url = "spark://<master-node-ip>:7077"  # Replace <master-node-ip> with your Spark master node IP
-	spark = initialize_spark("Wine Quality Prediction", master_url)
+print("Data prepared for training and validation.")
 
-	# Load and preprocess training data
-	training_file_path = "s3://Dataset4/TrainingDataset.csv"
-	training_data = spark.read.csv(training_file_path, header=True, inferSchema=True)
-	training_data = clean_column_names(training_data)
-	feature_cols = training_data.columns[:-1]  # Exclude label column
-	training_data = load_and_preprocess_data(spark, training_file_path, feature_cols)
+# Model utilizing the Random Forest Classifier algorithm
+rf = RandomForestClassifier(featuresCol='scaledFeatures', labelCol='quality')
 
-	# Train Logistic Regression model
-	lr_model = train_logistic_regression(training_data)
+# Perform model training
+rf_model = rf.fit(train_data)
 
-	# Load and preprocess validation data
-	validation_file_path = "s3://Dataset4/ValidationDataset.csv"
-	validation_data = load_and_preprocess_data(spark, validation_file_path, feature_cols)
+# Generate forecasts for the validation dataset
+valid_predictions = rf_model.transform(valid_data)
 
-	# Make predictions
-	predictions = lr_model.transform(validation_data)
+# Assess the model
+evaluator = MulticlassClassificationEvaluator(labelCol='quality', predictionCol='prediction', metricName='f1')
+f1_score = evaluator.evaluate(valid_predictions)
 
-	# Evaluate the model
-	f1_score = evaluate_model(predictions)
-	print(f"F1 Score: {f1_score}")
+print(f"Random Forest Classifier - F1 Score: {f1_score}")
 
-	# Save the model
-	lr_model.save("/home/ubuntu/winePrediction/lr_model")
+# Assess additional measures
+accuracy = evaluator.evaluate(valid_predictions, {evaluator.metricName: "accuracy"})
+precision = evaluator.evaluate(valid_predictions, {evaluator.metricName: "weightedPrecision"})
+recall = evaluator.evaluate(valid_predictions, {evaluator.metricName: "weightedRecall"})
 
-	# Stop the Spark session
-	spark.stop()
+print(f"Random Forest Classifier - Accuracy: {accuracy}")
+print(f"Random Forest Classifier - Precision: {precision}")
+print(f"Random Forest Classifier - Recall: {recall}")
 
-if __name__ == "__main__":
-	main()
+# Validating the application by using the validation dataset as the test dataset
+test_data = valid_data
+
+# Generate forecasts for the test dataset
+test_predictions = rf_model.transform(test_data)
+
+# Assess the model's performance using the F1 score
+f1_score_test = evaluator.evaluate(test_predictions)
+
+print(f"F1 Score on Test Data: {f1_score_test}")
+
+# Preserve the model
+rf_model.save("/home/ec2-user/rf_model")
+
+# Initialize the model
+loaded_model = RandomForestClassificationModel.load("/home/ec2-user/rf_model")
+
+# Utilize the pre-trained model to provide predictions.
+loaded_predictions = loaded_model.transform(test_data)
+
+# Assess the model that has been loaded.
+f1_score_loaded = evaluator.evaluate(loaded_predictions)
+
+print(f"Loaded Model - F1 Score: {f1_score_loaded}")
+print("MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM")
