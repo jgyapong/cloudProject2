@@ -1,80 +1,77 @@
 
 from pyspark.sql import SparkSession
-from pyspark.ml.classification import LogisticRegression
-from pyspark.ml.evaluation import MulticlassClassificationEvaluator
+from pyspark.ml import PipelineModel
+from pyspark.ml.classification import RandomForestClassificationModel
 from pyspark.ml.feature import VectorAssembler
+from pyspark.ml.evaluation import MulticlassClassificationEvaluator
 import os
 
-def set_spark_environment(spark_home, spark_bin):
-	"""Set the Spark home and update the PATH."""
-	os.environ['SPARK_HOME'] = spark_home
-	os.environ['PATH'] += os.pathsep + spark_bin
+# Instantiate the Spark session
+spark = SparkSession.builder.appName("ModelTesting").getOrCreate()
 
-def initialize_spark(app_name, master_url):
-	"""Initialize and return a Spark session."""
-	return SparkSession.builder \
-		.appName(wineQuaprediction) \
-		.master(master_url) \
-		.getOrCreate()
+# Define paths
+model_path = "/home/ec2-user/rf_model"
+validation_data_path = "/home/ec2-user/ValidationDataset_cleaned.csv"
+output_file = "/home/ec2-user/f1_score.txt"
 
-def clean_column_names(df):
-	"""Clean column names by removing spaces and quotes."""
-	return df.toDF(*(c.replace(' ', '').replace('"', '') for c in df.columns))
+# Verify the existence of the model path
+if not os.path.exists(model_path):
+    raise FileNotFoundError(f"Model path '{model_path}' does not exist.")
 
-def load_and_preprocess_data(spark, file_path, feature_cols):
-	"""Load and preprocess data from a CSV file."""
-	data = spark.read.csv(file_path, header=True, inferSchema=True)
-	data = clean_column_names(data)
-	assembler = VectorAssembler(inputCols=feature_cols, outputCol="features")
-	return assembler.transform(data).select("features", "quality")
+# Verify the existence of the validation data path
+if not os.path.exists(validation_data_path):
+    raise FileNotFoundError(f"Validation data path '{validation_data_path}' does not exist.")
 
-def train_logistic_regression(training_data):
-	"""Train a Logistic Regression model."""
-	lr = LogisticRegression(featuresCol='features', labelCol='quality')
-	return lr.fit(training_data)
+try:
+    # Attempt to load the model as a PipelineModel first
+    try:
+        model = PipelineModel.load(model_path)
+        print(f"PipelineModel loaded successfully from '{model_path}'.")
+    except Exception as e:
+        print(f"Failed to load as PipelineModel: {e}")
+        #If the loading process as a PipelineModel fails, try loading it as a RandomForestClassificationModel.
+        try:
+            model = RandomForestClassificationModel.load(model_path)
+            print(f"RandomForestClassificationModel loaded successfully from '{model_path}'.")
+        except Exception as e:
+            raise RuntimeError(f"Failed to load model: {e}")
 
-def evaluate_model(predictions):
-	"""Evaluate the model using F1 score."""
-	evaluator = MulticlassClassificationEvaluator(labelCol='quality', predictionCol='prediction', metricName='f1')
-	return evaluator.evaluate(predictions)
+    # Import the validation data
+    valid_data = spark.read.csv(validation_data_path, header=True, inferSchema=True, sep=';')
+    print("Validation data loaded successfully.")
 
-def main():
-	# Set Spark environment
-	spark_home = '/home/ubuntu/spark-3.5.0-bin-hadoop3'
-	spark_bin = os.path.join(spark_home, 'bin')
-	set_spark_environment(spark_home, spark_bin)
+    # Verify the presence of the features column; if it does not exist, generate it
+    required_columns = ["fixed acidity", "volatile acidity", "citric acid", "residual sugar",
+                        "chlorides", "free sulfur dioxide", "total sulfur dioxide",
+                        "density", "pH", "sulphates", "alcohol"]
 
-	# Initialize Spark session
-	master_url = "spark://<master-node-ip>:7077"  # Replace <master-node-ip> with your Spark master node IP
-	spark = initialize_spark("Wine Quality Prediction", master_url)
+    if set(required_columns).issubset(valid_data.columns):
+        # Generate feature vector
+        assembler = VectorAssembler(inputCols=required_columns, outputCol="features")
+        valid_data = assembler.transform(valid_data)
+    else:
+        raise RuntimeError("Validation data does not contain the required columns.")
 
-	# Load and preprocess training data
-	training_file_path = "s3://Dataset4/TrainingDataset.csv"
-	training_data = spark.read.csv(training_file_path, header=True, inferSchema=True)
-	training_data = clean_column_names(training_data)
-	feature_cols = training_data.columns[:-1]  # Exclude label column
-	training_data = load_and_preprocess_data(spark, training_file_path, feature_cols)
+    # Generate forecasts for the validation dataset
+    valid_predictions = model.transform(valid_data)
+    print("Predictions made on validation data.")
 
-	# Train Logistic Regression model
-	lr_model = train_logistic_regression(training_data)
+    # Assess the model's performance using the F1 Score metric
+    evaluator = MulticlassClassificationEvaluator(labelCol="quality", predictionCol="prediction", metricName="f1")
+    f1_score = evaluator.evaluate(valid_predictions)
 
-	# Load and preprocess validation data
-	validation_file_path = "s3://Dataset4/ValidationDataset.csv"
-	validation_data = load_and_preprocess_data(spark, validation_file_path, feature_cols)
+    # Save the F1 score to a file
+    with open(output_file, 'w') as f:
+        f.write(f"F1 Score on Validation Data: {f1_score}")
 
-	# Make predictions
-	predictions = lr_model.transform(validation_data)
+except FileNotFoundError as e:
+    print(f"FileNotFoundError: {e}")
+except RuntimeError as e:
+    print(f"RuntimeError: {e}")
+except Exception as e:
+    print(f"An unexpected error occurred: {e}")
 
-	# Evaluate the model
-	f1_score = evaluate_model(predictions)
-	print(f"F1 Score: {f1_score}")
-
-	# Save the model
-	lr_model.save("/home/ubuntu/winePrediction/lr_model")
-
-	# Stop the Spark session
-	spark.stop()
-
-if __name__ == "__main__":
-	main()
+finally:
+    # Terminate the Spark session
+    spark.stop()
 
