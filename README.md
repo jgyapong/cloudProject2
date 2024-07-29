@@ -30,3 +30,5 @@ Start the Spark cluster
 Execute the Training Script
 
 Compose a Dockerfile
+Link for docker hub Below
+https://hub.docker.com/layers/jgyapong/machine_learning/latest/images/sha256-7ce0b5c23928d9fe7fd9522ffd00735c4c0721593c8be0dc71100e769fb54af1?context=repo
